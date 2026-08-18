@@ -160,14 +160,50 @@ the config file entries.
 
 ```sql
 contracts (
-    ticker       TEXT PRIMARY KEY,   -- e.g. KXBTC-26JUN21-T100000
-    name         TEXT NOT NULL,      -- e.g. "BTC price on Jun 21, 2026?"
-    expiry_date  TEXT NOT NULL,      -- e.g. "2026-06-21T12:00:00Z"
-    fetched_at   TEXT NOT NULL       -- when this row was collected
+    ticker         TEXT PRIMARY KEY, -- e.g. KXBTC-26JUN21-T100000
+    name           TEXT NOT NULL,    -- event title after enrichment
+    event_ticker   TEXT NOT NULL,    -- e.g. KXBTC-26JUN21
+    expiry_date    TEXT NOT NULL,    -- close_time, e.g. "2026-06-21T12:00:00Z"
+    fetched_at     TEXT NOT NULL,    -- when this row was last written
+
+    -- static contract properties (correct whenever read)
+    open_time      TEXT,             -- LISTING date — when Kalshi opened it
+    created_time   TEXT,
+    status         TEXT,             -- active / finalized / settled
+    result         TEXT,             -- 'yes' / 'no' once settled
+    settlement_ts  TEXT,
+    title          TEXT,             -- market-level (strike) title
+
+    -- POINT-IN-TIME SNAPSHOT as of fetched_at — not a time series
+    yes_bid        REAL,
+    yes_ask        REAL,
+    last_price     REAL,
+    volume         REAL,
+    volume_24h     REAL,
+    open_interest  REAL,
+    liquidity      REAL
 )
 
 INDEX idx_expiry ON contracts(expiry_date)
+INDEX idx_open_time ON contracts(open_time)
+INDEX idx_result ON contracts(result)
 ```
+
+**`expiry_date` vs `open_time`.** `expiry_date` is when a contract *resolves*;
+`open_time` is when it was *listed*. Frequency measures in the style of
+Caldara-Iacoviello count documents by publication date, which is `open_time`.
+Binning on `expiry_date` answers a different question.
+
+**Prices are a snapshot, not a series.** The price and volume columns record a
+single observation taken at `fetched_at`. For settled markets they are
+degenerate (bid/ask collapse to 0/1). Building a price history requires
+repeated snapshots or the candlestick endpoint.
+
+**Schema versions.** v1 had no `event_ticker`; v2 added it; v3 adds everything
+below `fetched_at`. `marketgpr info` reports the version. Re-running
+`marketgpr collect` on a v1/v2 database migrates it in place and backfills the
+new columns by upsert — **enriched `name` values are preserved**, so a
+re-collect does not cost you an enrichment pass.
 
 ---
 

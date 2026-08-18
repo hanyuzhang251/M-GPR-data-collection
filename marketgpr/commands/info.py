@@ -47,14 +47,36 @@ def inspect_database(db_path: str) -> None:
     p(bold("Schema"))
 
     has_event = _has_column(conn, "contracts", "event_ticker")
-    if has_event:
-        p(ok(f"  Version:  v2 (event_ticker column present)"))
+    has_open  = _has_column(conn, "contracts", "open_time")
+    if has_open:
+        p(ok(f"  Version:  v3 (listing dates, resolutions and price snapshot)"))
+    elif has_event:
+        p(warn(f"  Version:  v2 (event_ticker only — no open_time/result/prices)"))
+        p(dim(f"            Re-collect with 'marketgpr collect' to backfill; "
+              f"enriched names are preserved."))
     else:
         p(warn(f"  Version:  v1 (no event_ticker column)"))
         p(dim(f"            Re-collect with 'marketgpr collect' for enrichment support."))
 
     cols = conn.execute("PRAGMA table_info(contracts)").fetchall()
     p(accent(f"  Columns:  {', '.join(r[1] for r in cols)}"))
+
+    # ── Coverage of the v3 columns (blank until a re-collect backfills them) ──
+    if has_open:
+        total = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
+        if total:
+            p("")
+            p(bold("Field coverage"))
+            for col, label in (("open_time", "Listing date"),
+                               ("result", "Resolution"),
+                               ("yes_bid", "Price snapshot")):
+                n = conn.execute(
+                    f"SELECT COUNT(*) FROM contracts WHERE {col} IS NOT NULL AND {col} != ''"
+                ).fetchone()[0]
+                pct = 100.0 * n / total
+                line = f"  {label:<16}{n:>12,} / {total:,}  ({pct:.1f}%)"
+                p(ok(line) if pct > 50 else warn(line))
+            p(dim("  Prices are a snapshot at fetch time, not a series."))
 
     # ── Rows ──
     total = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]

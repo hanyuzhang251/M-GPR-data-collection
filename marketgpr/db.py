@@ -32,15 +32,46 @@ DATA_DIR = os.environ.get(
 )
 os.makedirs(DATA_DIR, exist_ok=True)
 
-CREATE_CONTRACTS = """CREATE TABLE IF NOT EXISTS contracts (
-    ticker        TEXT PRIMARY KEY,
-    name          TEXT NOT NULL,
-    event_ticker  TEXT NOT NULL DEFAULT '',
-    expiry_date   TEXT NOT NULL,
-    fetched_at    TEXT NOT NULL
-)"""
+# Single source of truth for the contracts schema.  The first five columns are
+# the original v2 layout and must keep their order; everything after is added
+# by migration on existing databases, so all of it must be nullable.
+#
+# Snapshot vs static:  open_time, created_time, result and settlement_ts are
+# properties of the contract and are correct whenever they are read.  The
+# price/volume columns (yes_bid, yes_ask, last_price, volume, open_interest,
+# liquidity) are a single observation taken at fetched_at -- they are NOT a
+# time series, and for settled markets they are degenerate.  Use the
+# candlestick endpoint to build price histories.
+CONTRACT_COLUMNS = [
+    ("ticker",        "TEXT PRIMARY KEY"),
+    ("name",          "TEXT NOT NULL"),
+    ("event_ticker",  "TEXT NOT NULL DEFAULT ''"),
+    ("expiry_date",   "TEXT NOT NULL"),
+    ("fetched_at",    "TEXT NOT NULL"),
+    ("open_time",     "TEXT"),
+    ("created_time",  "TEXT"),
+    ("status",        "TEXT"),
+    ("result",        "TEXT"),
+    ("settlement_ts", "TEXT"),
+    ("title",         "TEXT"),
+    ("yes_bid",       "REAL"),
+    ("yes_ask",       "REAL"),
+    ("last_price",    "REAL"),
+    ("volume",        "REAL"),
+    ("volume_24h",    "REAL"),
+    ("open_interest", "REAL"),
+    ("liquidity",     "REAL"),
+]
+
+BASE_COLUMN_COUNT = 5  # ticker..fetched_at -- present in every schema version
+
+CREATE_CONTRACTS = "CREATE TABLE IF NOT EXISTS contracts (\n    " + ",\n    ".join(
+    f"{n:<14}{t}" for n, t in CONTRACT_COLUMNS
+) + "\n)"
 
 CREATE_EXPIRY_IDX  = "CREATE INDEX IF NOT EXISTS idx_expiry ON contracts(expiry_date)"
+CREATE_OPEN_IDX    = "CREATE INDEX IF NOT EXISTS idx_open_time ON contracts(open_time)"
+CREATE_RESULT_IDX  = "CREATE INDEX IF NOT EXISTS idx_result ON contracts(result)"
 
 BOLD  = "\033[1m"
 DIM   = "\033[2m"
@@ -91,21 +122,38 @@ def highlight(text: str) -> str:
     return f"{BOLD}{BRIGHT_BLUE}{text}{RESET}"
 
 
+def migrate_contracts(conn: sqlite3.Connection) -> list[str]:
+    """Add any columns from CONTRACT_COLUMNS that the table is missing.
+    Returns the names added.  Existing data is preserved -- new columns are
+    nullable and backfill on the next collect run."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(contracts)").fetchall()}
+    added = []
+    for name, decl in CONTRACT_COLUMNS[BASE_COLUMN_COUNT:]:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE contracts ADD COLUMN {name} {decl}")
+            added.append(name)
+    if "event_ticker" not in cols:
+        conn.execute(
+            "ALTER TABLE contracts ADD COLUMN event_ticker TEXT NOT NULL DEFAULT ''"
+        )
+        added.append("event_ticker")
+    return added
+
+
 def init_db(db_path: str) -> sqlite3.Connection:
     """Create / open a writable SQLite connection with performance PRAGMAs.
-    Migrates old schemas by adding the event_ticker column if missing."""
+    Migrates older schemas up to the current CONTRACT_COLUMNS layout."""
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA cache_size=-65536")
     conn.execute(CREATE_CONTRACTS)
-    conn.execute(CREATE_EXPIRY_IDX)
 
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(contracts)").fetchall()}
-    if "event_ticker" not in cols:
-        conn.execute(
-            "ALTER TABLE contracts ADD COLUMN event_ticker TEXT NOT NULL DEFAULT ''"
-        )
+    migrate_contracts(conn)
+
+    conn.execute(CREATE_EXPIRY_IDX)
+    conn.execute(CREATE_OPEN_IDX)
+    conn.execute(CREATE_RESULT_IDX)
 
     conn.commit()
     return conn

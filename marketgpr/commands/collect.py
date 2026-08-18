@@ -54,29 +54,77 @@ def parse_date(value: str) -> int:
     raise argparse.ArgumentTypeError(f"Unrecognized date format: {value}")
 
 
-def stream_insert(conn, markets: list[dict], fetched_at: str) -> int:
-    """Insert a page of markets.  Name is initially set to the ticker as
-    a placeholder; enrichment fills it in later.  event_ticker is stored
-    permanently so the standalone enrich command can use it.
-    Returns number newly inserted."""
+INSERT_COLUMNS = [
+    "ticker", "name", "event_ticker", "expiry_date", "fetched_at",
+    "open_time", "created_time", "status", "result", "settlement_ts",
+    "title", "yes_bid", "yes_ask", "last_price", "volume", "volume_24h",
+    "open_interest", "liquidity",
+]
+
+# On re-run, refresh everything except ticker (the key) and name -- name holds
+# the enriched event title and must survive a re-collect untouched.
+_UPDATE_COLUMNS = [c for c in INSERT_COLUMNS if c not in ("ticker", "name")]
+
+UPSERT_SQL = (
+    f"INSERT INTO contracts({','.join(INSERT_COLUMNS)}) "
+    f"VALUES ({','.join('?' * len(INSERT_COLUMNS))}) "
+    f"ON CONFLICT(ticker) DO UPDATE SET "
+    + ",".join(f"{c}=excluded.{c}" for c in _UPDATE_COLUMNS)
+)
+
+
+def _num(market: dict, key: str):
+    """Kalshi returns numerics as strings ('0.0040').  Empty -> None."""
+    raw = market.get(key)
+    if raw is None or raw == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def stream_insert(conn, markets: list[dict], fetched_at: str) -> tuple[int, int]:
+    """Upsert a page of markets.  On first insert, name is set to the ticker as
+    a placeholder; enrichment fills it in later and later runs preserve it.
+
+    Price and volume columns are a point-in-time snapshot as of fetched_at,
+    not a series.  open_time, created_time, result and settlement_ts are
+    static properties of the contract.
+
+    Returns (rows_written, rows_newly_inserted)."""
     rows = []
     for m in markets:
         t = m.get("ticker")
         if not t:
             continue
-        et = m.get("event_ticker", "")
         close = m.get("close_time", "") or m.get("expected_expiration_time", "") or ""
-        rows.append((t, t, et, close, fetched_at))
+        rows.append((
+            t, t,
+            m.get("event_ticker", ""),
+            close,
+            fetched_at,
+            m.get("open_time") or None,
+            m.get("created_time") or None,
+            m.get("status") or None,
+            m.get("result") or None,
+            m.get("settlement_ts") or None,
+            m.get("title") or None,
+            _num(m, "yes_bid_dollars"),
+            _num(m, "yes_ask_dollars"),
+            _num(m, "last_price_dollars"),
+            _num(m, "volume_fp"),
+            _num(m, "volume_24h_fp"),
+            _num(m, "open_interest_fp"),
+            _num(m, "liquidity_dollars"),
+        ))
     if not rows:
-        return 0
+        return 0, 0
     before = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
-    conn.executemany(
-        "INSERT OR IGNORE INTO contracts(ticker,name,event_ticker,expiry_date,fetched_at) VALUES (?,?,?,?,?)",
-        rows,
-    )
+    conn.executemany(UPSERT_SQL, rows)
     conn.commit()
     after = conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0]
-    return after - before
+    return len(rows), after - before
 
 
 def get_cutoff() -> float:
@@ -105,8 +153,9 @@ def _parse_close_ts(market: dict) -> float:
 
 def collect_live(conn, start_ts: int, end_ts: int,
                  fetched_at: str, delay: float) -> int:
-    """Stream live markets into the DB.  Returns number inserted."""
+    """Stream live markets into the DB.  Returns number newly inserted."""
     inserted = 0
+    written = 0
     cursor: str | None = None
     page = 0
     while True:
@@ -120,16 +169,18 @@ def collect_live(conn, start_ts: int, end_ts: int,
         items = data.get("markets", [])
         page += 1
         cursor = data.get("cursor")
-        n = stream_insert(conn, items, fetched_at)
+        w, n = stream_insert(conn, items, fetched_at)
         inserted += n
+        written += w
         if page % 10 == 0 or not cursor:
-            log.info("Live: page %4s  |  %4s items  |  %6s inserted  |  total_in_db %s",
-                     page, len(items), n,
+            log.info("Live: page %4s  |  %4s items  |  %6s new  |  %6s refreshed  |  total_in_db %s",
+                     page, len(items), n, w - n,
                      conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0])
         if not cursor:
             break
         time.sleep(delay)
-    log.info("Live complete — %s pages, %s inserted", page, inserted)
+    log.info("Live complete — %s pages, %s new, %s refreshed",
+             page, inserted, written - inserted)
     return inserted
 
 
@@ -139,6 +190,7 @@ def collect_historical(conn, start_ts: int,
     has no date filters, we paginate through *all* archived markets and stop
     when close_time drops below start_ts (results are ordered desc by date)."""
     inserted = 0
+    written = 0
     cursor: str | None = None
     page = 0
     while True:
@@ -152,12 +204,13 @@ def collect_historical(conn, start_ts: int,
 
         filtered = [m for m in items if _parse_close_ts(m) >= start_ts]
         skipped = len(items) - len(filtered)
-        n = stream_insert(conn, filtered, fetched_at)
+        w, n = stream_insert(conn, filtered, fetched_at)
         inserted += n
+        written += w
         earliest = min((_parse_close_ts(m) for m in items), default=0)
 
         if page % 10 == 0 or not cursor:
-            log.info("Hist: page %4s  |  %4s items  |  kept %4s  |  %6s inserted  |  earliest %s  |  total_in_db %s",
+            log.info("Hist: page %4s  |  %4s items  |  kept %4s  |  %6s new  |  earliest %s  |  total_in_db %s",
                      page, len(items), len(filtered), n,
                      datetime.fromtimestamp(earliest, tz=timezone.utc).strftime("%Y-%m-%d") if earliest else "?",
                      conn.execute("SELECT COUNT(*) FROM contracts").fetchone()[0])
@@ -170,7 +223,8 @@ def collect_historical(conn, start_ts: int,
             break
         time.sleep(delay)
 
-    log.info("Historical complete — %s pages, %s inserted", page, inserted)
+    log.info("Historical complete — %s pages, %s new, %s refreshed",
+             page, inserted, written - inserted)
     return inserted
 
 
