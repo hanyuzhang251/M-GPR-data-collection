@@ -9,6 +9,12 @@ description = "Kalshi prediction-market contract tools for geopolitical risk res
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# Needed for `marketgpr index` / `embed` / `search`. Requires a Python built
+# with loadable-extension support (Homebrew or Linux system Python — not the
+# python.org macOS framework build).
+semantic = ["sqlite-vec>=0.1.0", "sentence-transformers>=3.0.0"]
+
 [project.scripts]
 marketgpr = "marketgpr.cli:main"
 
